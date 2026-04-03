@@ -15,7 +15,7 @@ pnpm gateway:watch --force --verbose --raw-stream --raw-stream-path ~/.openclaw/
 ## 配置
 
 ```bash
-openclaw config set channels.timbot.sdkAppId "1600126417"
+openclaw config set channels.timbot.sdkAppId "YOUR_SDKAPPID"
 openclaw config set channels.timbot.secretKey ""
 openclaw config set channels.timbot.token ""
 ```

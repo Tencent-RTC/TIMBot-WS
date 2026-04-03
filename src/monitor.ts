@@ -71,6 +71,9 @@ const TIMBOT_PARTIAL_STREAM_THROTTLE_MS = 1000;
 const TIMBOT_STREAM_SOFT_LIMIT_BYTES = 11 * 1024;
 const TIMBOT_FINAL_TEXT_CHUNK_LIMIT = 3500;
 const TIMBOT_OVERFLOW_NOTICE_TEXT = "内容较长，已停止发送剩余内容。";
+const TIMBOT_MEDIA_MAX_BYTES = 5 * 1024 * 1024; // 5MB
+const TIMBOT_MEDIA_MAX_FILES = 8;
+const TIMBOT_MEDIA_FETCH_TIMEOUT_MS = 30_000;
 
 function buildReplyRuntimeConfig(config: OpenClawConfig): {
   config: OpenClawConfig;
@@ -340,10 +343,89 @@ type StreamingTransport = {
 
 // ============ SDK 消息适配 ============
 
+/** 从 SDK 图片消息 payload 中解析最大尺寸图片的 URL */
+function resolveImageUrl(payload: any): string | undefined {
+  // SDK payload.imageInfoArray: [{ sizeType, imageUrl, width, height, size }]
+  // sizeType: 0=原图, 1=大图, 2=缩略图
+  const imageInfoArray: any[] = payload?.imageInfoArray ?? [];
+  if (imageInfoArray.length === 0) return undefined;
+
+  // 优先原图(0) > 大图(1) > 缩略图(2)
+  for (const sizeType of [0, 1, 2]) {
+    const info = imageInfoArray.find((i: any) => i.sizeType === sizeType);
+    if (info?.imageUrl || info?.url) return info.imageUrl ?? info.url;
+  }
+  // fallback: 取第一个有 URL 的
+  const first = imageInfoArray.find((i: any) => i.imageUrl || i.url);
+  return first?.imageUrl ?? first?.url;
+}
+
+/** 从 SDK 消息 payload 中提取媒体信息 */
+export type InboundMediaInfo = {
+  url: string;
+  contentType?: string;
+  fileName?: string;
+  size?: number;
+  placeholder: string;
+};
+
+function extractMediaInfoFromPayload(msgType: string, payload: any): InboundMediaInfo | undefined {
+  if (!payload) return undefined;
+
+  switch (msgType) {
+    case "TIMImageElem": {
+      const url = resolveImageUrl(payload);
+      if (!url) return undefined;
+      return {
+        url,
+        contentType: "image/jpeg", // SDK 默认，下载后会检测实际类型
+        fileName: payload.fileName || undefined,
+        size: payload.imageInfoArray?.[0]?.size,
+        placeholder: "[image]",
+      };
+    }
+    case "TIMFileElem": {
+      const url = payload.fileUrl ?? payload.url;
+      if (!url) return undefined;
+      return {
+        url,
+        fileName: payload.fileName || undefined,
+        size: payload.fileSize,
+        placeholder: payload.fileName ? `[file: ${payload.fileName}]` : "[file]",
+      };
+    }
+    case "TIMSoundElem":
+    case "TIMAudioElem": {
+      const url = payload.remoteAudioUrl ?? payload.url;
+      if (!url) return undefined;
+      return {
+        url,
+        contentType: "audio/mpeg",
+        size: payload.size ?? payload.second,
+        placeholder: "[voice]",
+      };
+    }
+    case "TIMVideoFileElem": {
+      const url = payload.remoteVideoUrl ?? payload.videoUrl ?? payload.url;
+      if (!url) return undefined;
+      return {
+        url,
+        contentType: "video/mp4",
+        fileName: payload.videoName || undefined,
+        size: payload.videoSize,
+        placeholder: "[video]",
+      };
+    }
+    default:
+      return undefined;
+  }
+}
+
 /** 将 SDK Message 转换为内部格式 */
-function adaptSdkMessage(sdkMsg: Message): TimbotInboundMessage {
+function adaptSdkMessage(sdkMsg: Message): { msg: TimbotInboundMessage; mediaInfos: InboundMediaInfo[] } {
   const isGroup = sdkMsg.conversationType === "GROUP";
   const msgBody: TimbotMsgBodyElement[] = [];
+  const mediaInfos: InboundMediaInfo[] = [];
 
   const msgType = sdkMsg.type as string;
   if (msgType === "TIMTextElem") {
@@ -362,12 +444,20 @@ function adaptSdkMessage(sdkMsg: Message): TimbotInboundMessage {
     });
   } else if (msgType === "TIMImageElem") {
     msgBody.push({ MsgType: "TIMImageElem", MsgContent: {} });
+    const media = extractMediaInfoFromPayload("TIMImageElem", sdkMsg.payload);
+    if (media) mediaInfos.push(media);
   } else if (msgType === "TIMSoundElem") {
     msgBody.push({ MsgType: "TIMSoundElem", MsgContent: {} });
+    const media = extractMediaInfoFromPayload("TIMSoundElem", sdkMsg.payload);
+    if (media) mediaInfos.push(media);
   } else if (msgType === "TIMFileElem") {
     msgBody.push({ MsgType: "TIMFileElem", MsgContent: {} });
+    const media = extractMediaInfoFromPayload("TIMFileElem", sdkMsg.payload);
+    if (media) mediaInfos.push(media);
   } else if (msgType === "TIMVideoFileElem") {
     msgBody.push({ MsgType: "TIMVideoFileElem", MsgContent: {} });
+    const media = extractMediaInfoFromPayload("TIMVideoFileElem", sdkMsg.payload);
+    if (media) mediaInfos.push(media);
   } else if (msgType === "TIMFaceElem") {
     msgBody.push({ MsgType: "TIMFaceElem", MsgContent: {} });
   } else if (msgType === "TIMLocationElem") {
@@ -387,18 +477,99 @@ function adaptSdkMessage(sdkMsg: Message): TimbotInboundMessage {
   }
 
   return {
-    CallbackCommand: isGroup ? "Bot.OnGroupMessage" : "Bot.OnC2CMessage",
-    From_Account: sdkMsg.from,
-    To_Account: sdkMsg.to,
-    AtRobots_Account: atRobots.length > 0 ? atRobots : undefined,
-    GroupId: groupId,
-    MsgSeq: undefined,
-    MsgRandom: undefined,
-    MsgTime: sdkMsg.time,
-    MsgKey: sdkMsg.ID,
-    MsgBody: msgBody,
-    CloudCustomData: sdkMsg.cloudCustomData || undefined,
+    msg: {
+      CallbackCommand: isGroup ? "Bot.OnGroupMessage" : "Bot.OnC2CMessage",
+      From_Account: sdkMsg.from,
+      To_Account: sdkMsg.to,
+      AtRobots_Account: atRobots.length > 0 ? atRobots : undefined,
+      GroupId: groupId,
+      MsgSeq: undefined,
+      MsgRandom: undefined,
+      MsgTime: sdkMsg.time,
+      MsgKey: sdkMsg.ID,
+      MsgBody: msgBody,
+      CloudCustomData: sdkMsg.cloudCustomData || undefined,
+    },
+    mediaInfos,
   };
+}
+
+// ============ 入站媒体处理 ============
+
+type ResolvedMedia = {
+  path: string;
+  contentType?: string;
+  placeholder: string;
+};
+
+/**
+ * 下载并保存入站媒体文件到 OpenClaw 媒体存储。
+ * 
+ * 流程：
+ * 1. 从 SDK payload 中获取 COS URL
+ * 2. 通过 core.channel.media.fetchRemoteMedia() 下载（带 SSRF 防护）
+ * 3. 通过 core.channel.media.saveMediaBuffer() 保存到磁盘
+ * 4. 返回本地路径、MIME 类型供 inbound context 使用
+ */
+async function resolveInboundMedia(params: {
+  mediaInfos: InboundMediaInfo[];
+  core: PluginRuntime;
+  target: TimbotWsTarget;
+}): Promise<ResolvedMedia[]> {
+  const { mediaInfos, core, target } = params;
+  if (mediaInfos.length === 0) return [];
+
+  const limited = mediaInfos.slice(0, TIMBOT_MEDIA_MAX_FILES);
+  const results: ResolvedMedia[] = [];
+
+  for (const info of limited) {
+    try {
+      // 验证 URL 合法性
+      const parsed = new URL(info.url);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        log(target, "warn", `skip media with non-HTTP URL: ${parsed.protocol}`);
+        continue;
+      }
+
+      logVerbose(target, `downloading media: type=${info.placeholder}, url=${info.url.slice(0, 80)}...`);
+
+      // Step 1: 下载远程媒体
+      const fetched = await core.channel.media.fetchRemoteMedia({
+        url: info.url,
+        maxBytes: TIMBOT_MEDIA_MAX_BYTES,
+        filePathHint: info.fileName,
+        readIdleTimeoutMs: TIMBOT_MEDIA_FETCH_TIMEOUT_MS,
+      });
+
+      if (fetched.buffer.byteLength > TIMBOT_MEDIA_MAX_BYTES) {
+        log(target, "warn", `media too large (${(fetched.buffer.byteLength / 1024 / 1024).toFixed(1)}MB), skip`);
+        continue;
+      }
+
+      // Step 2: 保存到本地
+      const effectiveMime = info.contentType ?? fetched.contentType;
+      const saved = await core.channel.media.saveMediaBuffer(
+        fetched.buffer,
+        effectiveMime,
+        "inbound",
+        TIMBOT_MEDIA_MAX_BYTES,
+        info.fileName,
+      );
+
+      logVerbose(target, `media saved: path=${saved.path}, contentType=${saved.contentType}, size=${fetched.buffer.byteLength}`);
+
+      results.push({
+        path: saved.path,
+        contentType: effectiveMime ?? saved.contentType,
+        placeholder: info.placeholder,
+      });
+    } catch (err) {
+      log(target, "warn", `media download/save failed: ${String(err)}`);
+      // 跳过失败的媒体，继续处理其他
+    }
+  }
+
+  return results;
 }
 
 // ============ WS 消息处理 ============
@@ -435,7 +606,7 @@ export function handleWsMessage(params: {
       continue;
     }
 
-    const msg = adaptSdkMessage(sdkMsg);
+    const { msg, mediaInfos } = adaptSdkMessage(sdkMsg);
 
     target.statusSink?.({ lastInboundAt: Date.now() });
 
@@ -484,11 +655,11 @@ export function handleWsMessage(params: {
         continue;
       }
 
-      processGroupAndReply({ target: enrichedTarget, msg }).catch((err) => {
+      processGroupAndReply({ target: enrichedTarget, msg, mediaInfos }).catch((err) => {
         target.runtime.error?.(`[${target.account.accountId}] timbot group agent failed: ${String(err)}`);
       });
     } else {
-      processAndReply({ target: enrichedTarget, msg }).catch((err) => {
+      processAndReply({ target: enrichedTarget, msg, mediaInfos }).catch((err) => {
         target.runtime.error?.(`[${target.account.accountId}] timbot agent failed: ${String(err)}`);
       });
     }
@@ -1198,8 +1369,9 @@ async function executeStreamingReply(params: {
 async function processAndReply(params: {
   target: TimbotWsTarget;
   msg: TimbotInboundMessage;
+  mediaInfos: InboundMediaInfo[];
 }): Promise<void> {
-  const { target, msg } = params;
+  const { target, msg, mediaInfos } = params;
   const core = target.core;
   const config = target.config;
   const account = target.account;
@@ -1215,21 +1387,38 @@ async function processAndReply(params: {
 
   const rawBody = extractTextFromMsgBody(msg.MsgBody);
 
-  log(target, "info", `C2C message <- ${fromAccount}, msgKey=${msg.MsgKey}`);
+  log(target, "info", `C2C message <- ${fromAccount}, msgKey=${msg.MsgKey}${mediaInfos.length > 0 ? `, media=${mediaInfos.length}` : ""}`);
   logVerbose(target, `content: ${rawBody.slice(0, 200)}${rawBody.length > 200 ? "..." : ""}`);
 
-  if (!rawBody.trim()) {
-    log(target, "warn", "empty message, skip");
+  // 如果既没有文本也没有媒体，跳过
+  if (!rawBody.trim() && mediaInfos.length === 0) {
+    log(target, "warn", "empty message (no text, no media), skip");
     return;
   }
 
-  // 过滤占位符消息，但保留 TUIEmoji 表情
-  if (/^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
+  // 过滤占位符消息，但保留 TUIEmoji 表情；有媒体的消息不过滤
+  if (mediaInfos.length === 0 && /^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
     logVerbose(target, `placeholder message, skip: ${rawBody} (from: ${fromAccount})`);
     return;
   }
 
   logVerbose(target, `processing, account=${account.accountId}`);
+
+  // 下载并保存媒体
+  let resolvedMedia: ResolvedMedia[] = [];
+  if (mediaInfos.length > 0) {
+    resolvedMedia = await resolveInboundMedia({ mediaInfos, core, target });
+    logVerbose(target, `resolved media: ${resolvedMedia.length}/${mediaInfos.length} saved`);
+  }
+
+  // 构建 Body 文本：文本 + 媒体占位符
+  const bodyParts: string[] = [];
+  if (rawBody.trim()) bodyParts.push(rawBody);
+  for (const media of resolvedMedia) {
+    bodyParts.push(media.placeholder);
+  }
+  const effectiveBody = bodyParts.join("\n");
+  const effectiveRawBody = effectiveBody;
 
   const route = core.channel.routing.resolveAgentRoute({
     cfg: config,
@@ -1254,13 +1443,16 @@ async function processAndReply(params: {
     from: fromLabel,
     previousTimestamp,
     envelope: envelopeOptions,
-    body: rawBody,
+    body: effectiveBody,
   });
+
+  // 构建 media 字段
+  const firstMedia = resolvedMedia[0];
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
-    RawBody: rawBody,
-    CommandBody: rawBody,
+    RawBody: effectiveRawBody,
+    CommandBody: effectiveRawBody,
     From: `timbot:${fromAccount}`,
     To: `timbot:${account.botAccount || msg.To_Account || "bot"}`,
     SessionKey: route.sessionKey,
@@ -1274,6 +1466,13 @@ async function processAndReply(params: {
     MessageSid: msg.MsgKey,
     OriginatingChannel: "timbot-ws",
     OriginatingTo: `timbot:${fromAccount}`,
+    // Media fields
+    MediaPath: firstMedia?.path,
+    MediaType: firstMedia?.contentType,
+    MediaUrl: firstMedia?.path,
+    MediaPaths: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.path) : undefined,
+    MediaUrls: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.path) : undefined,
+    MediaTypes: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.contentType ?? "") : undefined,
   });
 
   await core.channel.session.recordInboundSession({
@@ -1377,8 +1576,9 @@ async function processAndReply(params: {
 async function processGroupAndReply(params: {
   target: TimbotWsTarget;
   msg: TimbotInboundMessage;
+  mediaInfos: InboundMediaInfo[];
 }): Promise<void> {
-  const { target, msg } = params;
+  const { target, msg, mediaInfos } = params;
   const core = target.core;
   const config = target.config;
   const account = target.account;
@@ -1395,20 +1595,37 @@ async function processGroupAndReply(params: {
 
   const rawBody = extractTextFromMsgBody(msg.MsgBody);
 
-  log(target, "info", `group message <- group:${groupId}, from=${fromAccount}, msgId=${msg.MsgKey}`);
+  log(target, "info", `group message <- group:${groupId}, from=${fromAccount}, msgId=${msg.MsgKey}${mediaInfos.length > 0 ? `, media=${mediaInfos.length}` : ""}`);
   logVerbose(target, `content: ${rawBody.slice(0, 200)}${rawBody.length > 200 ? "..." : ""}`);
 
-  if (!rawBody.trim()) {
-    log(target, "warn", "empty group message, skip");
+  // 如果既没有文本也没有媒体，跳过
+  if (!rawBody.trim() && mediaInfos.length === 0) {
+    log(target, "warn", "empty group message (no text, no media), skip");
     return;
   }
 
-  if (/^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
+  if (mediaInfos.length === 0 && /^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
     logVerbose(target, `placeholder message, skip: ${rawBody} (group=${groupId}, from=${fromAccount})`);
     return;
   }
 
   logVerbose(target, `processing group message, account=${account.accountId}, group=${groupId}`);
+
+  // 下载并保存媒体
+  let resolvedMedia: ResolvedMedia[] = [];
+  if (mediaInfos.length > 0) {
+    resolvedMedia = await resolveInboundMedia({ mediaInfos, core, target });
+    logVerbose(target, `resolved media: ${resolvedMedia.length}/${mediaInfos.length} saved`);
+  }
+
+  // 构建 Body 文本：文本 + 媒体占位符
+  const bodyParts: string[] = [];
+  if (rawBody.trim()) bodyParts.push(rawBody);
+  for (const media of resolvedMedia) {
+    bodyParts.push(media.placeholder);
+  }
+  const effectiveBody = bodyParts.join("\n");
+  const effectiveRawBody = effectiveBody;
 
   const route = core.channel.routing.resolveAgentRoute({
     cfg: config,
@@ -1434,15 +1651,18 @@ async function processGroupAndReply(params: {
     from: groupLabel,
     previousTimestamp,
     envelope: envelopeOptions,
-    body: rawBody,
+    body: effectiveBody,
     chatType: "group",
     senderLabel,
   });
 
+  // 构建 media 字段
+  const firstMedia = resolvedMedia[0];
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
-    RawBody: rawBody,
-    CommandBody: rawBody,
+    RawBody: effectiveRawBody,
+    CommandBody: effectiveRawBody,
     From: `timbot:group:${groupId}`,
     To: `timbot:${account.botAccount || msg.To_Account || "bot"}`,
     SessionKey: route.sessionKey,
@@ -1458,6 +1678,13 @@ async function processGroupAndReply(params: {
     OriginatingChannel: "timbot-ws",
     OriginatingTo: `timbot:group:${groupId}`,
     WasMentioned: true,
+    // Media fields
+    MediaPath: firstMedia?.path,
+    MediaType: firstMedia?.contentType,
+    MediaUrl: firstMedia?.path,
+    MediaPaths: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.path) : undefined,
+    MediaUrls: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.path) : undefined,
+    MediaTypes: resolvedMedia.length > 0 ? resolvedMedia.map((m) => m.contentType ?? "") : undefined,
   });
 
   await core.channel.session.recordInboundSession({

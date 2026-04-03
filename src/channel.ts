@@ -45,7 +45,7 @@ export const timbotPlugin: ChannelPlugin<ResolvedTimbotAccount> = {
   setupWizard: timbotWsSetupWizard,
   capabilities: {
     chatTypes: ["direct", "group"],
-    media: false,
+    media: true,
     reactions: false,
     threads: false,
     polls: false,
