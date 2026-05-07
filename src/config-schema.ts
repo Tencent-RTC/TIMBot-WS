@@ -33,7 +33,11 @@ const accountSchema = {
   additionalProperties: false,
 };
 
-export const timbotConfigSchema: ChannelConfigSchema = {
+/**
+ * Channel config schema for timbot-ws.
+ * Named following openclaw convention: *ChannelConfigSchema for auto-discovery.
+ */
+export const TimbotWsChannelConfigSchema: ChannelConfigSchema = {
   schema: {
     $schema: "http://json-schema.org/draft-07/schema#",
     type: "object",
@@ -60,3 +64,6 @@ export const timbotConfigSchema: ChannelConfigSchema = {
     additionalProperties: false,
   },
 };
+
+/** @deprecated Use TimbotWsChannelConfigSchema instead */
+export const timbotConfigSchema: ChannelConfigSchema = TimbotWsChannelConfigSchema;

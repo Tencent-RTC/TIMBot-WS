@@ -4,9 +4,106 @@
   "description": "Clawdbot Tencent Cloud IM intelligent bot channel plugin",
   "version": "2026.3.24",
   "channels": ["timbot-ws"],
+  "channelEnvVars": {
+    "timbot-ws": ["TIM_SDK_APPID", "TIM_USER_ID", "TIM_USER_SIG"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {}
+  },
+  "channelConfigs": {
+    "timbot-ws": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "sdkAppId": { "type": "string" },
+          "userId": { "type": "string" },
+          "userSig": { "type": "string" },
+          "welcomeText": { "type": "string" },
+          "typingText": { "type": "string" },
+          "typingDelayMs": { "type": "number", "minimum": 0 },
+          "streamingMode": { "type": "string", "enum": ["off", "custom_modify", "text_modify", "tim_stream"] },
+          "fallbackPolicy": { "type": "string", "enum": ["strict", "final_text"] },
+          "overflowPolicy": { "type": "string", "enum": ["stop", "split"] },
+          "chunkMode": { "type": "string" },
+          "dm": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "policy": { "type": "string", "enum": ["pairing", "allowlist", "open", "disabled"] },
+              "allowFrom": {
+                "type": "array",
+                "items": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
+              }
+            },
+            "additionalProperties": false
+          },
+          "defaultAccount": { "type": "string" },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "enabled": { "type": "boolean" },
+                "sdkAppId": { "type": "string" },
+                "userId": { "type": "string" },
+                "userSig": { "type": "string" },
+                "welcomeText": { "type": "string" },
+                "typingText": { "type": "string" },
+                "typingDelayMs": { "type": "number", "minimum": 0 },
+                "streamingMode": { "type": "string", "enum": ["off", "custom_modify", "text_modify", "tim_stream"] },
+                "fallbackPolicy": { "type": "string", "enum": ["strict", "final_text"] },
+                "overflowPolicy": { "type": "string", "enum": ["stop", "split"] },
+                "chunkMode": { "type": "string" },
+                "dm": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "policy": { "type": "string", "enum": ["pairing", "allowlist", "open", "disabled"] },
+                    "allowFrom": {
+                      "type": "array",
+                      "items": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "label": "Tencent IM",
+      "description": "Tencent Cloud IM bot via WebSocket SDK. Zero-config deployment - no public IP needed.",
+      "uiHints": {
+        "channels.timbot-ws.sdkAppId": {
+          "label": "SDK App ID",
+          "placeholder": "Your Tencent IM SDK App ID"
+        },
+        "channels.timbot-ws.userId": {
+          "label": "User ID",
+          "placeholder": "Bot user ID"
+        },
+        "channels.timbot-ws.userSig": {
+          "label": "User Sig",
+          "sensitive": true,
+          "placeholder": "Authentication signature"
+        },
+        "channels.timbot-ws.streamingMode": {
+          "label": "Streaming Mode",
+          "help": "off: no streaming; custom_modify: custom message modify; text_modify: text message modify; tim_stream: TIM native streaming"
+        },
+        "channels.timbot-ws.welcomeText": {
+          "label": "Welcome Text",
+          "placeholder": "Welcome message for new conversations"
+        }
+      }
+    }
   }
 }
