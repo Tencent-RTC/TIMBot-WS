@@ -16,6 +16,8 @@ import { LOG_PREFIX, logSimple } from "./logger.js";
 import {
   extractMentionedBotAccounts,
   extractTextFromMsgBody,
+  formatQuotedContext,
+  parseQuotedMessage,
   selectTimbotWebhookTarget,
 } from "./inbound-routing.js";
 import {
@@ -499,9 +501,22 @@ function adaptSdkMessage(sdkMsg: Message): { msg: TimbotInboundMessage; mediaInf
     const media = extractMediaInfoFromPayload("TIMVideoFileElem", sdkMsg.payload);
     if (media) mediaInfos.push(media);
   } else if (msgType === "TIMFaceElem") {
-    msgBody.push({ MsgType: "TIMFaceElem", MsgContent: {} });
+    msgBody.push({
+      MsgType: "TIMFaceElem",
+      MsgContent: {
+        Index: sdkMsg.payload?.index,
+        Data: sdkMsg.payload?.data ?? "",
+      },
+    });
   } else if (msgType === "TIMLocationElem") {
-    msgBody.push({ MsgType: "TIMLocationElem", MsgContent: {} });
+    msgBody.push({
+      MsgType: "TIMLocationElem",
+      MsgContent: {
+        Desc: sdkMsg.payload?.description ?? "",
+        Latitude: sdkMsg.payload?.latitude,
+        Longitude: sdkMsg.payload?.longitude,
+      },
+    });
   } else {
     msgBody.push({ MsgType: msgType || "TIMUnknownElem", MsgContent: {} });
   }
@@ -1474,8 +1489,11 @@ async function processAndReply(params: {
     return;
   }
 
-  // 过滤占位符消息，但保留 TUIEmoji 表情；有媒体的消息不过滤
-  if (mediaInfos.length === 0 && /^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
+  // 过滤纯占位符消息（无实际内容可传递给 Agent 的），但保留有内容的消息
+  // 只过滤: [image], [voice], [file], [video], [stream], [custom], [face], [location]（无附加信息时）
+  // 保留: [TUIEmoji_xxx], [custom: xxx], [face: xxx], [location: xxx], [custom-data: xxx]
+  const PURE_PLACEHOLDER_RE = /^\[(image|voice|file|video|stream|custom|face|location)\]$/;
+  if (mediaInfos.length === 0 && PURE_PLACEHOLDER_RE.test(rawBody.trim())) {
     logVerbose(target, `placeholder message, skip: ${rawBody} (from: ${fromAccount})`);
     return;
   }
@@ -1489,8 +1507,14 @@ async function processAndReply(params: {
     logVerbose(target, `resolved media: ${resolvedMedia.length}/${mediaInfos.length} saved`);
   }
 
-  // 构建 Body 文本：文本 + 媒体占位符
+  // 构建 Body 文本：引用消息 + 文本 + 媒体占位符
   const bodyParts: string[] = [];
+  // 解析引用消息（腾讯 IM 通过 CloudCustomData 传递引用信息）
+  const quotedMsg = parseQuotedMessage(msg.CloudCustomData);
+  if (quotedMsg) {
+    bodyParts.push(formatQuotedContext(quotedMsg));
+    logVerbose(target, `quoted message detected: sender=${quotedMsg.messageSender}, abstract=${quotedMsg.messageAbstract.slice(0, 50)}`);
+  }
   if (rawBody.trim()) bodyParts.push(rawBody);
   for (const media of resolvedMedia) {
     bodyParts.push(media.placeholder);
@@ -1683,7 +1707,9 @@ async function processGroupAndReply(params: {
     return;
   }
 
-  if (mediaInfos.length === 0 && /^\[.+\]$/.test(rawBody.trim()) && !/^\[TUIEmoji_/i.test(rawBody.trim())) {
+  // 过滤纯占位符消息（无实际内容可传递给 Agent 的），但保留有内容的消息
+  const PURE_PLACEHOLDER_RE = /^\[(image|voice|file|video|stream|custom|face|location)\]$/;
+  if (mediaInfos.length === 0 && PURE_PLACEHOLDER_RE.test(rawBody.trim())) {
     logVerbose(target, `placeholder message, skip: ${rawBody} (group=${groupId}, from=${fromAccount})`);
     return;
   }
@@ -1697,8 +1723,14 @@ async function processGroupAndReply(params: {
     logVerbose(target, `resolved media: ${resolvedMedia.length}/${mediaInfos.length} saved`);
   }
 
-  // 构建 Body 文本：文本 + 媒体占位符
+  // 构建 Body 文本：引用消息 + 文本 + 媒体占位符
   const bodyParts: string[] = [];
+  // 解析引用消息（腾讯 IM 通过 CloudCustomData 传递引用信息）
+  const quotedMsg = parseQuotedMessage(msg.CloudCustomData);
+  if (quotedMsg) {
+    bodyParts.push(formatQuotedContext(quotedMsg));
+    logVerbose(target, `quoted message detected: sender=${quotedMsg.messageSender}, abstract=${quotedMsg.messageAbstract.slice(0, 50)}`);
+  }
   if (rawBody.trim()) bodyParts.push(rawBody);
   for (const media of resolvedMedia) {
     bodyParts.push(media.placeholder);

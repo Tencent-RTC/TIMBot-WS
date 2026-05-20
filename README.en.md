@@ -125,6 +125,7 @@ openclaw config set channels.timbot-ws.typingText "Thinking, please wait..."
 
 - feat: **Multi-Agent support** — Configure a separate bot account for each Agent.
 - feat: Supports @mentions in group chats with message history context.
+- feat: Supports location messages, emoji messages, and custom messages.
 
 ---
 

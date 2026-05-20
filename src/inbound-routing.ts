@@ -42,7 +42,10 @@ export function extractTextFromMsgBody(msgBody?: TimbotMsgBodyElement[]): string
     if (elem.MsgType === "TIMTextElem" && elem.MsgContent?.Text) {
       texts.push(elem.MsgContent.Text);
     } else if (elem.MsgType === "TIMCustomElem") {
-      texts.push("[custom]");
+      const desc = elem.MsgContent?.Desc ?? "";
+      let data = elem.MsgContent?.Data ?? "";
+      if (data.length > 200) data = data.slice(0, 200) + "...";
+      texts.push(`[custom] ${desc}, ${data}`);
     } else if (elem.MsgType === "TIMImageElem") {
       texts.push("[image]");
     } else if (elem.MsgType === "TIMSoundElem") {
@@ -52,15 +55,55 @@ export function extractTextFromMsgBody(msgBody?: TimbotMsgBodyElement[]): string
     } else if (elem.MsgType === "TIMVideoFileElem") {
       texts.push("[video]");
     } else if (elem.MsgType === "TIMFaceElem") {
-      texts.push("[face]");
+      const faceIndex = elem.MsgContent?.Index ?? "";
+      const faceData = elem.MsgContent?.Data ?? "";
+      texts.push(`[face] ${faceIndex}, ${faceData}`);
     } else if (elem.MsgType === "TIMLocationElem") {
-      texts.push("[location]");
+      const locDesc = elem.MsgContent?.Desc ?? "";
+      const lat = elem.MsgContent?.Latitude ?? "";
+      const lng = elem.MsgContent?.Longitude ?? "";
+      texts.push(`[location] ${locDesc}, ${lat}, ${lng}`);
     } else if (elem.MsgType === "TIMStreamElem") {
       texts.push("[stream]");
     }
   }
 
   return texts.join("\n");
+}
+
+/**
+ * 从 CloudCustomData 中解析引用消息信息（腾讯 IM 的引用/回复消息）。
+ * CloudCustomData 是一段 JSON 字符串，结构如：
+ * { "messageReply": { "messageID": "...", "messageAbstract": "原始消息内容",
+ *   "messageSender": "发送者", "messageType": 1, "version": 1 } }
+ */
+export function parseQuotedMessage(cloudCustomData?: string): {
+  messageAbstract: string;
+  messageSender: string;
+  messageID?: string;
+} | undefined {
+  if (!cloudCustomData) return undefined;
+  try {
+    const parsed = JSON.parse(cloudCustomData);
+    const reply = parsed?.messageReply;
+    if (reply && typeof reply.messageAbstract === "string" && reply.messageAbstract.trim()) {
+      return {
+        messageAbstract: reply.messageAbstract,
+        messageSender: reply.messageSender || "unknown",
+        messageID: reply.messageID,
+      };
+    }
+  } catch {
+    // CloudCustomData 可能不是 JSON 或没有引用信息，忽略
+  }
+  return undefined;
+}
+
+/**
+ * 将引用消息格式化为可注入到 Body 中的文本。
+ */
+export function formatQuotedContext(quoted: { messageAbstract: string; messageSender: string }): string {
+  return `[引用 ${quoted.messageSender} 的消息: "${quoted.messageAbstract}"]`;
 }
 
 export function extractMentionedBotAccounts(rawBody: string): string[] {

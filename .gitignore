@@ -15,3 +15,5 @@ dist
 dev-install.sh
 
 im-node-sdk-dist
+
+demos/*

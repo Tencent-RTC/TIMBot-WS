@@ -52,6 +52,7 @@ bash install-timbot-ws.sh
 
 - feat: **支持多 Agent 模式** — 为每个 Agent 配置不同的机器人账号。
 - feat: 支持群聊@携带上下文历史消息。
+- feat: 支持位置消息、表情消息、自定义消息。
 
 ### 2026.4.8
 
