@@ -17,10 +17,10 @@ For a full integration tutorial, see: **[Tencent Cloud Official Documentation](h
 | **Deployment** | No public IP needed | Requires public IP + HTTPS |
 | **Connection** | Long-lived connection | Passive Webhook callbacks |
 | **Use Cases** | Local dev, intranet, quick prototyping | Production, high concurrency, multi-instance |
-| **Multi-Agent** | 🚧 Single-bot multi-agent not supported | ✅ Supported |
+| **Multi-Agent** | ✅ Supported | ✅ Supported |
 | **Streaming** | ⚠️ Partial (text_modify/custom_modify only) | ✅ Full support (including native TIMStreamElem) |
 
-> ⚠️ **Note**: timbot-ws currently does not support single-bot multi-agent mode. Use timbot (Webhook version) if you need this feature. See [Limitations](#limitations).
+> ✅ **Multi-Agent**: timbot-ws now supports multi-agent mode. See [Multi-Agent Setup Guide](#multi-agent-setup-guide).
 
 ---
 
@@ -123,6 +123,7 @@ openclaw config set channels.timbot-ws.typingText "Thinking, please wait..."
 
 ### 2026.5.20
 
+- feat: **Multi-Agent support** — Configure a separate bot account for each Agent.
 - feat: Supports @mentions in group chats with message history context.
 
 ---
@@ -143,6 +144,158 @@ The `tim_stream` mode (native `TIMStreamElem` streaming messages) is **not avail
 | `custom_modify` | ✅ | Custom message modification, frontend renders |
 | `tim_stream` | ❌ | Not supported, use timbot (Webhook version) |
 
-### Single-Bot Multi-Agent Not Supported
+---
 
-timbot-ws currently **does not support single-bot multi-agent mode**.
+## Multi-Agent Setup Guide
+
+timbot-ws supports configuring multiple bot accounts under the same Tencent IM application. Each bot binds to a different OpenClaw Agent, enabling a "different conversation = different AI assistant" experience.
+
+### Prerequisites
+
+- timbot-ws >= 2026.5.20
+- OpenClaw >= 2026.3.24
+
+### Step 1: Create Agent Workspaces
+
+Create an independent workspace for each Agent:
+
+```bash
+openclaw agents add translator
+openclaw agents add coder
+```
+
+Each Agent has its own SOUL.md (persona), AGENTS.md (behavior instructions), session storage, and auth configuration.
+
+### Step 2: Configure timbot-ws Multi-Account
+
+#### Option A: CLI Commands (Recommended)
+
+```bash
+# Set default account
+openclaw config set channels.timbot-ws.defaultAccount default
+
+# Set botAccount (userId) for each account
+openclaw config set channels.timbot-ws.accounts.default.botAccount "@RBT#001"
+openclaw config set channels.timbot-ws.accounts.translator.botAccount "@RBT#002"
+openclaw config set channels.timbot-ws.accounts.coder.botAccount "@RBT#003"
+
+# Override top-level config per account (optional)
+openclaw config set channels.timbot-ws.accounts.coder.streamingMode text_modify
+```
+
+You can also use `--batch-json` for batch configuration:
+
+```bash
+openclaw config set --batch-json '[
+  { "path": "channels.timbot-ws.defaultAccount", "value": "default" },
+  { "path": "channels.timbot-ws.accounts.default.botAccount", "value": "@RBT#001" },
+  { "path": "channels.timbot-ws.accounts.translator.botAccount", "value": "@RBT#002" },
+  { "path": "channels.timbot-ws.accounts.coder.botAccount", "value": "@RBT#003" }
+]'
+```
+
+#### Option B: Edit Config File Manually
+
+Edit `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "channels": {
+    "timbot-ws": {
+      "sdkAppId": "1600012345",
+      "userId": "@RBT#001",
+      "userSig": "your-main-user-sig",
+
+      "streamingMode": "off",
+      "dm": { "policy": "open", "allowFrom": ["*"] },
+
+      "defaultAccount": "default",
+
+      "accounts": {
+        "default": {
+          "botAccount": "@RBT#001"
+        },
+        "translator": {
+          "botAccount": "@RBT#002",
+          "userId": "@RBT#002",
+          "userSig": "<UserSig generated for @RBT#002>"
+        },
+        "coder": {
+          "botAccount": "@RBT#003",
+          "userId": "@RBT#003",
+          "userSig": "<UserSig generated for @RBT#003>",
+          "streamingMode": "text_modify"
+        }
+      }
+    }
+  }
+}
+```
+
+Account-level fields override top-level fields of the same name. Unspecified fields inherit from top-level defaults. Shared credentials like `sdkAppId` only need to be written once at the top level.
+
+### Step 3: Add Bindings
+
+Bindings map timbot-ws accountIds to OpenClaw agentIds.
+
+#### Option A: CLI Commands (Recommended)
+
+```bash
+# Bind timbot-ws accounts to their respective agents
+openclaw agents bind --agent main --bind timbot-ws:default
+openclaw agents bind --agent translator --bind timbot-ws:translator
+openclaw agents bind --agent coder --bind timbot-ws:coder
+
+# Verify bindings
+openclaw agents bindings
+```
+
+#### Option B: Edit Config File Manually
+
+Add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "agents": {
+    "list": [
+      { "id": "main", "default": true, "workspace": "~/.openclaw/workspace" },
+      { "id": "translator", "workspace": "~/.openclaw/workspace-translator" },
+      { "id": "coder", "workspace": "~/.openclaw/workspace-coder" }
+    ]
+  },
+
+  "bindings": [
+    { "agentId": "main",       "match": { "channel": "timbot-ws", "accountId": "default" } },
+    { "agentId": "translator", "match": { "channel": "timbot-ws", "accountId": "translator" } },
+    { "agentId": "coder",      "match": { "channel": "timbot-ws", "accountId": "coder" } }
+  ]
+}
+```
+
+### Step 4: Set Agent Personas
+
+Edit `SOUL.md` in each Agent's workspace to define its personality:
+
+```bash
+# Translator
+echo "You are a professional translator, skilled in Chinese-English translation. Translate content provided by the user in a concise and accurate style." \
+  > ~/.openclaw/workspace-translator/SOUL.md
+
+# Coder
+echo "You are a senior programmer, skilled in code review, debugging, and writing. Include code examples in your responses." \
+  > ~/.openclaw/workspace-coder/SOUL.md
+```
+
+### Step 5: Restart and Verify
+
+```bash
+# Restart Gateway
+openclaw gateway restart
+
+# Check agents and bindings
+openclaw agents list --bindings
+
+# Check channel status
+openclaw channels status --probe
+```
+

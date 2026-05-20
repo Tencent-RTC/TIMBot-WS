@@ -17,8 +17,17 @@ import type { ResolvedTimbotAccount } from "./types.js";
 import { registerWsTarget, handleWsMessage, sendTimbotMessage, sendTimbotGroupMessage } from "./monitor.js";
 import type { TimbotWsTarget } from "./monitor.js";
 import { WsTransport } from "./ws-transport.js";
+import { WorkerTransport } from "./worker-transport.js";
+import type { TransportInterface } from "./transport-interface.js";
 import { getTimbotRuntime } from "./runtime.js";
 import { logSimple } from "./logger.js";
+
+/**
+ * 追踪当前进程中已被「直连模式」占用的 SDKAppID。
+ * 同一 SDKAppID 的第一个账号用直连 WsTransport（零开销），
+ * 后续账号自动切换到 WorkerTransport（线程隔离，绕过 SDK 单例限制）。
+ */
+const occupiedSdkAppIds = new Set<number>();
 
 const meta = {
   id: "timbot-ws",
@@ -227,175 +236,15 @@ export const timbotPlugin: ChannelPlugin<ResolvedTimbotAccount> = {
         return;
       }
 
-      const transport = new WsTransport({
-        sdkAppId,
-        userID,
-        userSig,
-        log: (level, msg) => {
-          if (level === "error") ctx.log?.error(msg);
-          else if (level === "warn") ctx.log?.warn(msg);
-          else ctx.log?.info(msg);
-        },
-      });
-
-      // 登录重试，遇到致命错误时立即停止
-      let loginSuccess = false;
-      let lastLoginError: string | undefined;
-      let needsReconfigure = false;
-      const maxRetries = 5;
-      const baseDelay = 1000;
-
-      // 致命错误码，需要用户重新配置
-      // 参考文档: https://cloud.tencent.com/document/product/269/1671
-      const FATAL_ERROR_CODES: Record<number, string> = {
-        70001: "UserSig 已过期，请重新生成",
-        70003: "UserSig 解析失败，请使用官网 API 重新生成",
-        70009: "UserSig 验证失败，请检查 SDKAppID 和密钥是否匹配",
-        70013: "请求中的 UserID 与生成 UserSig 时使用的 UserID 不一致",
-        70014: "请求中的 SDKAppID 与生成 UserSig 时使用的 SDKAppID 不一致",
-        70016: "密钥/公钥不存在，请检查 SDKAppID 和 IM 数据中心是否一致",
-        70017: "UserSig 已被撤销",
-        70020: "SDKAppID 不存在，请检查 SDKAppID 和 IM 数据中心是否一致",
-        70050: "UserSig 验证失败且请求频率超限，请1分钟后重试",
-        70051: "账号被拉入黑名单，请联系腾讯云 IM 技术支持",
-        70107: "用户账号未导入 IM 系统，请先导入账号",
-        70398: "账号数超限，请升级为专业版",
-        70399: "账号被删除后三个月内不允许重新导入",
-        72000: "DAU 超过免费额度，请升级套餐",
-        72002: "MAU 超过免费额度，请升级套餐",
-      };
-      
-      // 可重试的临时错误
-      const RETRYABLE_ERROR_CODES = new Set([70169, 70500, 72010]);
-
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-          await transport.login();
-          loginSuccess = true;
-          break;
-        } catch (err: any) {
-          const errorCode = err?.code ?? err?.errorCode;
-          lastLoginError = err instanceof Error ? err.message : String(err);
-
-          // 致命错误，停止重试
-          if (errorCode && FATAL_ERROR_CODES[errorCode]) {
-            const hint = FATAL_ERROR_CODES[errorCode];
-            ctx.log?.error(`[${account.accountId}] login failed (${errorCode}): ${hint}`);
-            ctx.log?.error(`[${account.accountId}] run 'openclaw onboard timbot-ws' to reconfigure`);
-            lastLoginError = `${hint} (${errorCode})`;
-            needsReconfigure = true;
-            break;
-          }
-
-          if (attempt < maxRetries) {
-            const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
-            ctx.log?.warn(`[${account.accountId}] login attempt ${attempt + 1} failed: ${lastLoginError}, retry in ${delay}ms`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-          }
-        }
+      // 判断是否需要使用 Worker 线程隔离（同 SDKAppID 已有直连实例时）
+      if (occupiedSdkAppIds.has(sdkAppId)) {
+        ctx.log?.info(`[${account.accountId}] sdkAppId=${sdkAppId} already occupied, using worker thread isolation`);
+        return startAccountViaWorker(ctx, { sdkAppId, userID, userSig });
       }
 
-      if (!loginSuccess) {
-        const retryInfo = needsReconfigure ? "" : ` after ${maxRetries + 1} attempts`;
-        ctx.log?.error(`[${account.accountId}] login failed${retryInfo}: ${lastLoginError}`);
-        ctx.setStatus({
-          accountId: account.accountId,
-          running: false,
-          connected: false,
-          configured: !needsReconfigure,
-          lastError: needsReconfigure 
-            ? `${lastLoginError}. Run 'openclaw onboard timbot-ws' to reconfigure`
-            : `login failed: ${lastLoginError}`,
-        });
-        await transport.destroy();
-        return;
-      }
-
-      // 获取运行时
-      let core: any;
-      try {
-        core = getTimbotRuntime();
-      } catch {
-        core = {} as any;
-      }
-
-      const wsTarget: TimbotWsTarget = {
-        account,
-        config: ctx.cfg as OpenClawConfig,
-        runtime: {
-          log: (msg) => ctx.log?.info(msg),
-          warn: (msg) => ctx.log?.warn(msg),
-          error: (msg) => ctx.log?.error(msg),
-        },
-        core,
-        transport,
-        statusSink: (patch) => ctx.setStatus({ accountId: ctx.accountId, ...patch }),
-      };
-
-      const unregister = registerWsTarget(wsTarget);
-
-      transport.onMessageReceived((messageList) => {
-        let latestCore: any;
-        try {
-          latestCore = getTimbotRuntime();
-        } catch {
-          latestCore = core;
-        }
-        handleWsMessage({
-          messageList,
-          target: { ...wsTarget, core: latestCore },
-        });
-      });
-
-      // 注册网络状态变化监听，实时更新连接状态
-      transport.onNetStateChange(({ state }) => {
-        const isConnected = state === "connected";
-        ctx.log?.info(`[${account.accountId}] network state changed: ${state}, connected=${isConnected}`);
-        ctx.setStatus({
-          accountId: account.accountId,
-          connected: isConnected,
-          ...(isConnected ? { lastConnectedAt: Date.now() } : {}),
-        });
-      });
-
-      ctx.log?.info(`[${account.accountId}] connected via WebSocket, sdkAppId=${sdkAppId}, userID=${userID}`);
-      ctx.setStatus({
-        accountId: account.accountId,
-        running: true,
-        configured: true,
-        connected: true,
-        lastConnectedAt: Date.now(),
-        lastStartAt: Date.now(),
-      });
-
-      // 保持运行直到收到 abort 信号
-      return new Promise<void>((resolve) => {
-        const onAbort = async () => {
-          unregister();
-
-          const timeout = setTimeout(() => {}, 30000);
-          try {
-            await transport.destroy();
-          } catch (err) {
-            ctx.log?.warn(`[${account.accountId}] destroy error: ${String(err)}`);
-          }
-          clearTimeout(timeout);
-
-          ctx.log?.info(`[${account.accountId}] disconnected`);
-          ctx.setStatus({
-            accountId: account.accountId,
-            running: false,
-            connected: false,
-            lastStopAt: Date.now(),
-          });
-          resolve();
-        };
-        if (ctx.abortSignal.aborted) {
-          onAbort();
-          return;
-        }
-        ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
-      });
+      // 首个使用此 SDKAppID 的账号：直连模式（零开销）
+      occupiedSdkAppIds.add(sdkAppId);
+      return startAccountDirect(ctx, { sdkAppId, userID, userSig });
     },
     stopAccount: async (ctx) => {
       ctx.setStatus({
@@ -404,6 +253,335 @@ export const timbotPlugin: ChannelPlugin<ResolvedTimbotAccount> = {
         connected: false,
         lastStopAt: Date.now(),
       });
+      // 释放 SDKAppID 占位（如果是直连模式的账号）
+      const sdkAppId = Number(ctx.account.sdkAppId);
+      if (sdkAppId && !isNaN(sdkAppId)) {
+        occupiedSdkAppIds.delete(sdkAppId);
+      }
     },
   },
 };
+
+// ============ 直连模式启动（同 SDKAppID 的第一个账号） ============
+
+// 致命错误码，需要用户重新配置
+// 参考文档: https://cloud.tencent.com/document/product/269/1671
+const FATAL_ERROR_CODES: Record<number, string> = {
+  70001: "UserSig 已过期，请重新生成",
+  70003: "UserSig 解析失败，请使用官网 API 重新生成",
+  70009: "UserSig 验证失败，请检查 SDKAppID 和密钥是否匹配",
+  70013: "请求中的 UserID 与生成 UserSig 时使用的 UserID 不一致",
+  70014: "请求中的 SDKAppID 与生成 UserSig 时使用的 SDKAppID 不一致",
+  70016: "密钥/公钥不存在，请检查 SDKAppID 和 IM 数据中心是否一致",
+  70017: "UserSig 已被撤销",
+  70020: "SDKAppID 不存在，请检查 SDKAppID 和 IM 数据中心是否一致",
+  70050: "UserSig 验证失败且请求频率超限，请1分钟后重试",
+  70051: "账号被拉入黑名单，请联系腾讯云 IM 技术支持",
+  70107: "用户账号未导入 IM 系统，请先导入账号",
+  70398: "账号数超限，请升级为专业版",
+  70399: "账号被删除后三个月内不允许重新导入",
+  72000: "DAU 超过免费额度，请升级套餐",
+  72002: "MAU 超过免费额度，请升级套餐",
+};
+
+async function startAccountDirect(ctx: any, params: { sdkAppId: number; userID: string; userSig: string }): Promise<void> {
+  const { sdkAppId, userID, userSig } = params;
+  const account = ctx.account;
+
+  const transport = new WsTransport({
+    sdkAppId,
+    userID,
+    userSig,
+    log: (level: string, msg: string) => {
+      if (level === "error") ctx.log?.error(msg);
+      else if (level === "warn") ctx.log?.warn(msg);
+      else ctx.log?.info(msg);
+    },
+  });
+
+  // 登录重试，遇到致命错误时立即停止
+  let loginSuccess = false;
+  let lastLoginError: string | undefined;
+  let needsReconfigure = false;
+  const maxRetries = 5;
+  const baseDelay = 1000;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await transport.login();
+      loginSuccess = true;
+      break;
+    } catch (err: any) {
+      const errorCode = err?.code ?? err?.errorCode;
+      lastLoginError = err instanceof Error ? err.message : String(err);
+
+      // 致命错误，停止重试
+      if (errorCode && FATAL_ERROR_CODES[errorCode]) {
+        const hint = FATAL_ERROR_CODES[errorCode];
+        ctx.log?.error(`[${account.accountId}] login failed (${errorCode}): ${hint}`);
+        ctx.log?.error(`[${account.accountId}] run 'openclaw onboard timbot-ws' to reconfigure`);
+        lastLoginError = `${hint} (${errorCode})`;
+        needsReconfigure = true;
+        break;
+      }
+
+      if (attempt < maxRetries) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+        ctx.log?.warn(`[${account.accountId}] login attempt ${attempt + 1} failed: ${lastLoginError}, retry in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  if (!loginSuccess) {
+    const retryInfo = needsReconfigure ? "" : ` after ${maxRetries + 1} attempts`;
+    ctx.log?.error(`[${account.accountId}] login failed${retryInfo}: ${lastLoginError}`);
+    ctx.setStatus({
+      accountId: account.accountId,
+      running: false,
+      connected: false,
+      configured: !needsReconfigure,
+      lastError: needsReconfigure
+        ? `${lastLoginError}. Run 'openclaw onboard timbot-ws' to reconfigure`
+        : `login failed: ${lastLoginError}`,
+    });
+    await transport.destroy();
+    return;
+  }
+
+  // 获取运行时
+  let core: any;
+  try {
+    core = getTimbotRuntime();
+  } catch {
+    core = {} as any;
+  }
+
+  const wsTarget: TimbotWsTarget = {
+    account,
+    config: ctx.cfg as OpenClawConfig,
+    runtime: {
+      log: (msg: string) => ctx.log?.info(msg),
+      warn: (msg: string) => ctx.log?.warn(msg),
+      error: (msg: string) => ctx.log?.error(msg),
+    },
+    core,
+    transport,
+    statusSink: (patch: any) => ctx.setStatus({ accountId: ctx.accountId, ...patch }),
+  };
+
+  const unregister = registerWsTarget(wsTarget);
+
+  transport.onMessageReceived((messageList: any[]) => {
+    let latestCore: any;
+    try {
+      latestCore = getTimbotRuntime();
+    } catch {
+      latestCore = core;
+    }
+    handleWsMessage({
+      messageList,
+      target: { ...wsTarget, core: latestCore },
+    });
+  });
+
+  // 注册网络状态变化监听，实时更新连接状态
+  transport.onNetStateChange(({ state }: { state: string }) => {
+    const isConnected = state === "connected";
+    ctx.log?.info(`[${account.accountId}] network state changed: ${state}, connected=${isConnected}`);
+    ctx.setStatus({
+      accountId: account.accountId,
+      connected: isConnected,
+      ...(isConnected ? { lastConnectedAt: Date.now() } : {}),
+    });
+  });
+
+  ctx.log?.info(`[${account.accountId}] connected via WebSocket, sdkAppId=${sdkAppId}, userID=${userID}`);
+  ctx.setStatus({
+    accountId: account.accountId,
+    running: true,
+    configured: true,
+    connected: true,
+    lastConnectedAt: Date.now(),
+    lastStartAt: Date.now(),
+  });
+
+  // 保持运行直到收到 abort 信号
+  return new Promise<void>((resolve) => {
+    const onAbort = async () => {
+      unregister();
+
+      const timeout = setTimeout(() => {}, 30000);
+      try {
+        await transport.destroy();
+      } catch (err) {
+        ctx.log?.warn(`[${account.accountId}] destroy error: ${String(err)}`);
+      }
+      clearTimeout(timeout);
+
+      ctx.log?.info(`[${account.accountId}] disconnected`);
+      ctx.setStatus({
+        accountId: account.accountId,
+        running: false,
+        connected: false,
+        lastStopAt: Date.now(),
+      });
+      resolve();
+    };
+    if (ctx.abortSignal.aborted) {
+      onAbort();
+      return;
+    }
+    ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// ============ Worker 线程模式启动（同 SDKAppID 的第 2+ 个账号） ============
+
+async function startAccountViaWorker(ctx: any, params: { sdkAppId: number; userID: string; userSig: string }): Promise<void> {
+  const { sdkAppId, userID, userSig } = params;
+  const account = ctx.account;
+
+  const transport: TransportInterface = new WorkerTransport({
+    sdkAppId,
+    userID,
+    userSig,
+    log: (level: string, msg: string) => {
+      if (level === "error") ctx.log?.error(msg);
+      else if (level === "warn") ctx.log?.warn(msg);
+      else ctx.log?.info(msg);
+    },
+  });
+
+  // 登录重试（与直连模式相同逻辑）
+  let loginSuccess = false;
+  let lastLoginError: string | undefined;
+  let needsReconfigure = false;
+  const maxRetries = 5;
+  const baseDelay = 1000;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await transport.login();
+      loginSuccess = true;
+      break;
+    } catch (err: any) {
+      const errorCode = err?.code ?? err?.errorCode;
+      lastLoginError = err instanceof Error ? err.message : String(err);
+
+      if (errorCode && FATAL_ERROR_CODES[errorCode]) {
+        const hint = FATAL_ERROR_CODES[errorCode];
+        ctx.log?.error(`[${account.accountId}] login failed (${errorCode}): ${hint}`);
+        ctx.log?.error(`[${account.accountId}] run 'openclaw onboard timbot-ws' to reconfigure`);
+        lastLoginError = `${hint} (${errorCode})`;
+        needsReconfigure = true;
+        break;
+      }
+
+      if (attempt < maxRetries) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+        ctx.log?.warn(`[${account.accountId}] login attempt ${attempt + 1} failed: ${lastLoginError}, retry in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  if (!loginSuccess) {
+    const retryInfo = needsReconfigure ? "" : ` after ${maxRetries + 1} attempts`;
+    ctx.log?.error(`[${account.accountId}] login failed${retryInfo}: ${lastLoginError}`);
+    ctx.setStatus({
+      accountId: account.accountId,
+      running: false,
+      connected: false,
+      configured: !needsReconfigure,
+      lastError: needsReconfigure
+        ? `${lastLoginError}. Run 'openclaw onboard timbot-ws' to reconfigure`
+        : `login failed: ${lastLoginError}`,
+    });
+    await transport.destroy();
+    return;
+  }
+
+  // 获取运行时
+  let core: any;
+  try {
+    core = getTimbotRuntime();
+  } catch {
+    core = {} as any;
+  }
+
+  const wsTarget: TimbotWsTarget = {
+    account,
+    config: ctx.cfg as OpenClawConfig,
+    runtime: {
+      log: (msg: string) => ctx.log?.info(msg),
+      warn: (msg: string) => ctx.log?.warn(msg),
+      error: (msg: string) => ctx.log?.error(msg),
+    },
+    core,
+    transport,
+    statusSink: (patch: any) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+  };
+
+  const unregister = registerWsTarget(wsTarget);
+
+  transport.onMessageReceived((messageList: any[]) => {
+    let latestCore: any;
+    try {
+      latestCore = getTimbotRuntime();
+    } catch {
+      latestCore = core;
+    }
+    handleWsMessage({
+      messageList,
+      target: { ...wsTarget, core: latestCore },
+    });
+  });
+
+  transport.onNetStateChange(({ state }: { state: string }) => {
+    const isConnected = state === "connected";
+    ctx.log?.info(`[${account.accountId}] network state changed: ${state}, connected=${isConnected}`);
+    ctx.setStatus({
+      accountId: account.accountId,
+      connected: isConnected,
+      ...(isConnected ? { lastConnectedAt: Date.now() } : {}),
+    });
+  });
+
+  ctx.log?.info(`[${account.accountId}] connected via Worker thread, sdkAppId=${sdkAppId}, userID=${userID}`);
+  ctx.setStatus({
+    accountId: account.accountId,
+    running: true,
+    configured: true,
+    connected: true,
+    lastConnectedAt: Date.now(),
+    lastStartAt: Date.now(),
+  });
+
+  // 保持运行直到收到 abort 信号
+  return new Promise<void>((resolve) => {
+    const onAbort = async () => {
+      unregister();
+
+      try {
+        await transport.destroy();
+      } catch (err) {
+        ctx.log?.warn(`[${account.accountId}] destroy error: ${String(err)}`);
+      }
+
+      ctx.log?.info(`[${account.accountId}] disconnected (worker thread)`);
+      ctx.setStatus({
+        accountId: account.accountId,
+        running: false,
+        connected: false,
+        lastStopAt: Date.now(),
+      });
+      resolve();
+    };
+    if (ctx.abortSignal.aborted) {
+      onAbort();
+      return;
+    }
+    ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
+  });
+}

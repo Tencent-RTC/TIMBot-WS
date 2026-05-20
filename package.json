@@ -1,6 +1,6 @@
 {
   "name": "timbot-ws",
-  "version": "2026.5.19-beta.2",
+  "version": "2026.5.19-beta.5",
   "type": "module",
   "description": "OpenClaw Tencent Cloud IM intelligent bot channel plugin via WebSocket SDK",
   "author": "longyuqi@tencent.com",

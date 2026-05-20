@@ -29,7 +29,8 @@ import {
   buildTextMsgBody,
 } from "./streaming-policy.js";
 import type { TimbotTimStreamChunk } from "./streaming-policy.js";
-import type { WsTransport, Message } from "./ws-transport.js";
+import type { Message } from "./ws-transport.js";
+import type { TransportInterface } from "./transport-interface.js";
 
 export type TimbotRuntimeEnv = {
   log?: (message: string) => void;
@@ -75,7 +76,7 @@ export type TimbotWsTarget = {
   config: OpenClawConfig;
   runtime: TimbotRuntimeEnv;
   core: PluginRuntime;
-  transport: WsTransport;
+  transport: TransportInterface;
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
 };
 
