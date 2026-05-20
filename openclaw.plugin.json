@@ -30,6 +30,7 @@
           "fallbackPolicy": { "type": "string", "enum": ["strict", "final_text"] },
           "overflowPolicy": { "type": "string", "enum": ["stop", "split"] },
           "chunkMode": { "type": "string" },
+          "historyLimit": { "type": "number", "minimum": 0, "description": "Max group chat context messages to buffer (0 = disabled)" },
           "dm": {
             "type": "object",
             "properties": {
@@ -60,6 +61,7 @@
                 "fallbackPolicy": { "type": "string", "enum": ["strict", "final_text"] },
                 "overflowPolicy": { "type": "string", "enum": ["stop", "split"] },
                 "chunkMode": { "type": "string" },
+                "historyLimit": { "type": "number", "minimum": 0, "description": "Max group chat context messages to buffer (0 = disabled)" },
                 "dm": {
                   "type": "object",
                   "properties": {

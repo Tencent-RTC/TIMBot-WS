@@ -119,6 +119,14 @@ openclaw config set channels.timbot-ws.typingText "Thinking, please wait..."
 
 ---
 
+## Changelog
+
+### 2026.5.20
+
+- feat: Supports @mentions in group chats with message history context.
+
+---
+
 ## Limitations
 
 ### tim_stream Mode Not Supported

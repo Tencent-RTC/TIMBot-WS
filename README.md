@@ -48,6 +48,10 @@ bash install-timbot-ws.sh
 
 ## Changelog
 
+### 2026.5.20
+
+- feat: 支持群聊@携带上下文历史消息。
+
 ### 2026.4.8
 
 - fix: 修复 openclaw 新版本安装失败问题， 限制 openclaw 最低支持版本为 v2026.3.24

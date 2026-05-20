@@ -1,4 +1,10 @@
 import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
+import {
+  buildPendingHistoryContextFromMap,
+  clearHistoryEntriesIfEnabled,
+  recordPendingHistoryEntryIfEnabled,
+  type HistoryEntry,
+} from "openclaw/plugin-sdk/reply-history";
 
 import type {
   ResolvedTimbotAccount,
@@ -30,6 +36,39 @@ export type TimbotRuntimeEnv = {
   warn?: (message: string) => void;
   error?: (message: string) => void;
 };
+
+// ============ 群聊历史缓冲区（History Buffer） ============
+
+/**
+ * 群聊消息 pending 历史缓冲区（使用 openclaw/plugin-sdk/reply-history 标准模式）。
+ *
+ * 当群聊中的消息未触发 agent run（未 @机器人）时，通过
+ * `recordPendingHistoryEntryIfEnabled` 记录到 `groupHistoryMap`；
+ * 当下次 agent run 被触发时（用户 @了机器人），通过
+ * `buildPendingHistoryContextFromMap` 将 pending 消息注入到 Body 字符串，
+ * 格式为 [Chat messages since your last reply - for context]。
+ *
+ * 回复完成后通过 `clearHistoryEntriesIfEnabled` 清空 pending 缓冲区。
+ *
+ * 默认容量为 50 条（可通过配置 messages.groupChat.historyLimit 修改）。
+ */
+const DEFAULT_GROUP_HISTORY_LIMIT = 50;
+
+/** 每个群会话的 pending 消息缓冲区（标准 reply-history Map） */
+const groupHistoryMap = new Map<string, HistoryEntry[]>();
+
+/** 获取群会话的 history key */
+function resolveGroupHistoryKey(accountId: string, groupId: string): string {
+  return `${accountId}::group::${groupId}`;
+}
+
+/** 获取群聊 history limit 配置 */
+function resolveGroupHistoryLimit(config: any): number {
+  const limit = config?.messages?.groupChat?.historyLimit
+    ?? config?.channels?.["timbot-ws"]?.historyLimit
+    ?? DEFAULT_GROUP_HISTORY_LIMIT;
+  return typeof limit === "number" && limit >= 0 ? limit : DEFAULT_GROUP_HISTORY_LIMIT;
+}
 
 export type TimbotWsTarget = {
   account: ResolvedTimbotAccount;
@@ -661,7 +700,34 @@ export function handleWsMessage(params: {
       );
 
       if (!wasMentioned && !wasMentionedByAtList) {
-        logVerbose(target, `group msg not mentioned, skip: group=${msg.GroupId}, from=${msg.From_Account}, atUserList=${JSON.stringify(sdkMsg.atUserList)}, botIdentifiers=${JSON.stringify([...botIdentifiers])}`);
+        // 未被 @，不触发回复，但将消息记录到 pending history buffer
+        // 下次被 @ 时，这些消息会作为群聊上下文注入到 Body
+        const groupId = msg.GroupId?.trim() || "unknown";
+        const historyLimit = resolveGroupHistoryLimit(target.config);
+
+        if (historyLimit > 0) {
+          const senderNickForBuffer = (typeof sdkMsg.nameCard === "string" && sdkMsg.nameCard.trim())
+            || (typeof sdkMsg.nick === "string" && sdkMsg.nick.trim())
+            || msg.From_Account || "unknown";
+          const msgText = rawBody.trim() || "[non-text message]";
+          const historyKey = resolveGroupHistoryKey(target.account.accountId, groupId);
+
+          recordPendingHistoryEntryIfEnabled({
+            historyMap: groupHistoryMap,
+            historyKey,
+            limit: historyLimit,
+            entry: {
+              sender: senderNickForBuffer,
+              body: msgText,
+              timestamp: Date.now(),
+              messageId: sdkMsg.ID,
+            },
+          });
+
+          logVerbose(target, `group msg buffered (not mentioned): group=${groupId}, from=${msg.From_Account}, bufferSize=${groupHistoryMap.get(historyKey)?.length ?? 0}/${historyLimit}`);
+        } else {
+          logVerbose(target, `group msg not mentioned, historyLimit=0, skip: group=${groupId}, from=${msg.From_Account}`);
+        }
         continue;
       }
 
@@ -1648,6 +1714,9 @@ async function processGroupAndReply(params: {
 
   logVerbose(target, `route: agentId=${route.agentId}, group=${groupId}`);
 
+  const historyKey = resolveGroupHistoryKey(account.accountId, groupId);
+  const historyLimit = resolveGroupHistoryLimit(config);
+
   const groupLabel = `group:${groupId}`;
   const senderLabel = senderNick ? `${senderNick} (${fromAccount})` : `user:${fromAccount}`;
   const storePath = core.channel.session.resolveStorePath(config.session?.store, {
@@ -1658,7 +1727,7 @@ async function processGroupAndReply(params: {
     storePath,
     sessionKey: route.sessionKey,
   });
-  const body = core.channel.reply.formatAgentEnvelope({
+  let combinedBody = core.channel.reply.formatAgentEnvelope({
     channel: "TIMBOT",
     from: groupLabel,
     previousTimestamp,
@@ -1668,11 +1737,35 @@ async function processGroupAndReply(params: {
     senderLabel,
   });
 
+  // 将 pending history 注入到 Body
+  combinedBody = buildPendingHistoryContextFromMap({
+    historyMap: groupHistoryMap,
+    historyKey,
+    limit: historyLimit,
+    currentMessage: combinedBody,
+    formatEntry: (entry) =>
+      core.channel.reply.formatAgentEnvelope({
+        channel: "TIMBOT",
+        from: groupLabel,
+        timestamp: entry.timestamp,
+        body: entry.body,
+        chatType: "group",
+        senderLabel: entry.sender,
+        envelope: envelopeOptions,
+      }),
+  });
+
+  const pendingCount = groupHistoryMap.get(historyKey)?.length ?? 0;
+  if (pendingCount > 0) {
+    logVerbose(target, `injecting ${pendingCount} pending history entries as Body context for group=${groupId}`);
+  }
+
   // 构建 media 字段
   const firstMedia = resolvedMedia[0];
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
-    Body: body,
+    Body: combinedBody,
+    BodyForAgent: combinedBody,
     RawBody: effectiveRawBody,
     CommandBody: effectiveRawBody,
     From: `timbot:group:${groupId}`,
@@ -1790,6 +1883,13 @@ async function processGroupAndReply(params: {
     useTimStream: isTimStreamMode(streamingMode),
     typingText: (account.config.typingText ?? "正在思考中...").trim(),
     hasTypingText: Boolean((account.config.typingText ?? "正在思考中...").trim()),
+  });
+
+  // 回复完成后清空 pending history
+  clearHistoryEntriesIfEnabled({
+    historyMap: groupHistoryMap,
+    historyKey,
+    limit: historyLimit,
   });
 
   log(target, "info", `group done <- group:${groupId}, from=${fromAccount}`);
