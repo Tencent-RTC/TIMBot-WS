@@ -134,15 +134,50 @@ export const timbotPlugin: ChannelPlugin<ResolvedTimbotAccount> = {
     deliveryMode: "direct",
     chunkerMode: "text",
     textChunkLimit: 10000,
-    sendText: async ({ account, target, text }) => {
+    sendText: async (ctx: any) => {
+      // - { cfg, to, accountId, text, kind, ... }
+      // - { account, target, text }
+      const to = ctx?.to ?? ctx?.target;
+      const text = ctx?.text;
+      const cfg = ctx?.cfg;
+      const accountId = ctx?.accountId ?? ctx?.account?.accountId ?? DEFAULT_ACCOUNT_ID;
+
+      let account = ctx?.account;
+      if (!account && cfg) {
+        account = resolveTimbotAccount({ cfg, accountId });
+      }
+
+      if (!to || typeof to !== "string") {
+        return {
+          channel: "timbot-ws",
+          ok: false,
+          messageId: "",
+          error: new Error(
+            "Delivering to Tencent IM requires target <userid> or group:<groupid>"
+          ),
+        };
+      }
+      if (!account) {
+        return {
+          channel: "timbot-ws",
+          ok: false,
+          messageId: "",
+          error: new Error(
+            `timbot-ws sendText: cannot resolve account (accountId=${accountId})`
+          ),
+        };
+      }
+
+      const fromAccount = account.userId || "administrator";
+
       // 群消息以 group: 开头
-      if (target.startsWith("group:")) {
-        const groupId = target.slice("group:".length);
+      if (to.startsWith("group:")) {
+        const groupId = to.slice("group:".length);
         const result = await sendTimbotGroupMessage({
           account,
           groupId,
           text,
-          fromAccount: account.userId,
+          fromAccount,
         });
         return {
           channel: "timbot-ws",
@@ -154,9 +189,9 @@ export const timbotPlugin: ChannelPlugin<ResolvedTimbotAccount> = {
 
       const result = await sendTimbotMessage({
         account,
-        toAccount: target,
+        toAccount: to,
         text,
-        fromAccount: account.userId,
+        fromAccount,
       });
 
       return {
